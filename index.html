@@ -137,6 +137,7 @@ input[type=range]{width:100%;margin:0;accent-color:var(--acc);height:22px}
 .clipbar button{height:34px;padding:0 10px;border-radius:8px;border:1px solid var(--line);background:var(--surf2);font-size:13px;white-space:nowrap;flex:none}
 .clipbar .take{font-family:var(--f-num);font-size:12px;min-width:44px;text-align:center}
 .clipbar input[type=range]{width:96px;flex:none}
+.clipbar button:disabled{opacity:.4}
 .clipbar .danger{color:var(--rec)}
 
 /* 녹음기 막대 */
@@ -221,6 +222,8 @@ input[type=range]{width:100%;margin:0;accent-color:var(--acc);height:22px}
       <option value="2">2/4</option><option value="3">3/4</option><option value="4">4/4</option><option value="6">6/8</option>
     </select>
     <button class="tg" id="bCount" aria-pressed="true"><span class="dot"></span>카운트인</button>
+    <button class="tg" id="bLoop" aria-pressed="false"><span class="dot"></span>구간 반복</button>
+    <select class="tg" id="selRate" aria-label="재생 빠르기"><option value="1">빠르기 100%</option><option value="0.9">90%</option><option value="0.8">80%</option><option value="0.7">70%</option><option value="0.6">60%</option><option value="0.5">50%</option></select>
     <button class="tg" id="bTuner">튜너</button>
     <span class="vsep"></span>
     <button class="tg" id="bZoomO" aria-label="축소">−</button>
@@ -246,8 +249,10 @@ input[type=range]{width:100%;margin:0;accent-color:var(--acc);height:22px}
   <div class="bar clipbar" id="clipbar" hidden>
     <span class="lbl" id="cbName"></span>
     <button id="cbPrev" aria-label="이전 테이크">◀</button><span class="take" id="cbTake">1/1</span><button id="cbNext" aria-label="다음 테이크">▶</button>
+    <button id="cbSplit">여기서 나누기</button><button id="cbJoin">옆 구간과 합치기</button>
+    <button id="cbClean">소리 정리</button>
     <button id="cbL">← 10ms</button><button id="cbR">10ms →</button>
-    <span class="lbl">크기</span><input type="range" id="cbGain" min="-24" max="12" step="0.5" aria-label="클립 소리 크기"><span class="lbl" id="cbGainV">0dB</span>
+    <span class="lbl">크기</span><input type="range" id="cbGain" min="-24" max="18" step="0.5" aria-label="클립 소리 크기"><span class="lbl" id="cbGainV">0dB</span>
     <button id="cbDel" class="danger">테이크 지우기</button>
   </div>
 
@@ -267,7 +272,7 @@ input[type=range]{width:100%;margin:0;accent-color:var(--acc);height:22px}
 
 <script>
 'use strict';
-const VERSION='0.1.0';
+const VERSION='0.2.0';
 const $=s=>document.querySelector(s);
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
 const uid=()=>Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4);
@@ -306,23 +311,37 @@ const idb={db:null,
 
 /* ───────── 상태 ───────── */
 let P=null;                 // 지금 프로젝트
-const BUF=new Map();        // 버퍼 id → {sr,data,peaks,ab}
+const BUF=new Map();        // 버퍼 id → {sr,data,peaks,abs}
 let undoStack=[];
-let selT=null, selClip=false, armed=null;
+let selT=null, selClip=false, selS=0, armed=null;
 let view={pps:46,x0:0};
 let pos=0, playing=false, recording=false, playFrom=0, playT0=0;
 let saveTimer=null;
 
-function newProject(name){return{id:uid(),name:name||'새 합주',bpm:90,beats:4,metro:true,countIn:true,tracks:[],master:{vol:0,room:'hall'},created:Date.now(),updated:Date.now(),view:{pps:46,x0:0}}}
+function newProject(name){return{id:uid(),name:name||'새 합주',bpm:90,beats:4,metro:true,countIn:true,tracks:[],master:{vol:0,room:'hall'},loop:{on:false,a:0,b:0},rate:1,created:Date.now(),updated:Date.now(),view:{pps:46,x0:0}}}
 function newTrack(inst){const I=INST[inst]||INST.other;const n=P.tracks.filter(t=>t.inst===inst).length;
-  return{id:uid(),name:I.name+(n?' '+(n+1):''),inst,vol:-3,pan:I.pan,eq:I.eq.slice(),rev:I.rev,mute:false,solo:false,takes:[],active:0}}
+  return{id:uid(),name:I.name+(n?' '+(n+1):''),inst,vol:-3,pan:I.pan,eq:I.eq.slice(),rev:I.rev,mute:false,solo:false,takes:[],cuts:[],pick:[0]}}
+// 0.1 프로젝트(active 하나) → 0.2(나눔 cuts + 구간별 pick)
+function migrate(p){for(const t of p.tracks){if(!Array.isArray(t.cuts)){t.cuts=[];t.pick=[t.takes.length?clamp(t.active||0,0,t.takes.length-1):0]}delete t.active}
+  if(!p.loop)p.loop={on:false,a:0,b:0};if(!p.rate)p.rate=1;return p}
 const trk=id=>P.tracks.find(t=>t.id===id);
-const takeOf=t=>t&&t.takes[t.active];
-function projEnd(){let e=0;for(const t of P.tracks){const c=takeOf(t);if(c)e=Math.max(e,c.off+c.te)}return e}
+// 트랙의 구간: 나눔(cuts)으로 갈린 [a,b) 마다 고른 테이크(pick, -1 = 비움)
+function segs(t){const r=[],cs=t.cuts;for(let i=0;i<=cs.length;i++)r.push({i,a:i?cs[i-1]:-Infinity,b:i<cs.length?cs[i]:Infinity,k:t.pick[i],c:t.takes[t.pick[i]]||null});return r}
+function segIdx(t){return t&&t.id===selT?clamp(selS,0,t.cuts.length):0}
+function segAt(t,x){let i=0;while(i<t.cuts.length&&x>=t.cuts[i])i++;return i}
+const takeOf=t=>t?t.takes[t.pick[segIdx(t)]]||null:null;
+function clipSpan(c,sg){return[Math.max(c.off+c.ts,sg.a),Math.min(c.off+c.te,sg.b)]}
+function projEnd(){let e=0;for(const t of P.tracks)for(const sg of segs(t)){if(!sg.c)continue;const [a,b]=clipSpan(sg.c,sg);if(b>a)e=Math.max(e,b)}return e}
+function usedTakes(t){return [...new Set(t.pick)].filter(k=>k>=0&&t.takes[k]).map(k=>t.takes[k])}
+function removeTake(t,k){t.takes.splice(k,1);if(!t.takes.length){t.cuts=[];t.pick=[0];return}
+  t.pick=t.pick.map(p=>p===k?Math.min(k,t.takes.length-1):p>k?p-1:p)}
+// 새 테이크 k 가 걸친 구간은 그 테이크로
+function useNewTake(t,k){const c=t.takes[k],r0=c.off+c.ts,r1=c.off+c.te,sg=segs(t);
+  t.pick=t.pick.map((p,i)=>(sg[i].b>r0&&sg[i].a<r1)||!t.takes[p]?k:p);selT=t.id;selClip=true;selS=segAt(t,r0+0.001)}
 
 function touch(){P.updated=Date.now();clearTimeout(saveTimer);saveTimer=setTimeout(saveProject,600)}
 async function saveProject(){if(!P)return;P.view={pps:view.pps,x0:view.x0};try{await idb.put('projects',JSON.parse(JSON.stringify(P)))}catch(e){toast('저장하지 못했습니다: '+e.message)}}
-function pushUndo(){undoStack.push(JSON.stringify({tracks:P.tracks,bpm:P.bpm,beats:P.beats,master:P.master}));if(undoStack.length>60)undoStack.shift();$('#bUndo').disabled=false}
+function pushUndo(){undoStack.push(JSON.stringify({tracks:P.tracks,bpm:P.bpm,beats:P.beats,master:P.master,loop:P.loop}));if(undoStack.length>60)undoStack.shift();$('#bUndo').disabled=false}
 function undo(){if(!undoStack.length||recording)return;const s=JSON.parse(undoStack.pop());const was=playing;if(was)stopPlay();Object.assign(P,s);if(!trk(selT))selT=null;if(!trk(armed))armed=null;syncChains();renderAll();touch();$('#bUndo').disabled=!undoStack.length;toast('되돌렸습니다')}
 
 /* ───────── 오디오 엔진 ───────── */
@@ -356,43 +375,81 @@ function syncChains(){if(!ac)return;for(const [id,c] of CH){if(!trk(id)){try{c.p
   for(const t of P.tracks){let c=CH.get(t.id);if(!c){c=makeChain(ac,M,t);CH.set(t.id,c)}else applyChain(ac,c,t,false)}
   if(M.room!==P.master.room){M.conv.buffer=makeIR(ac,P.master.room);M.room=P.master.room}
   M.in.gain.setTargetAtTime(dbToGain(P.master.vol),ac.currentTime,0.02)}
-function abFor(ctx,id){const b=BUF.get(id);if(!b)return null;if(ctx===ac&&b.ab)return b.ab;const ab=ctx.createBuffer(1,b.data.length,b.sr);ab.copyToChannel(b.data,0);if(ctx===ac)b.ab=ab;return ab}
-// 클립 한 개를 ctx 시각 t0(=타임라인 from)에 맞춰 예약
-function schedClip(ctx,chainIn,c,t0,from,list){const ab=abFor(ctx,c.buf);if(!ab)return;
-  const rs=c.off+c.ts,re=c.off+c.te;if(re<=from+0.001)return;
-  const st=Math.max(rs,from),when=t0+(st-from),bo=c.ts+(st-rs),dur=re-st;
-  const g=ctx.createGain();const G=dbToGain(c.gain||0);const fi=Math.max(0.004,c.fi),fo=Math.max(0.004,c.fo);
-  const env=x=>{let v=G;if(x<rs+fi)v=G*clamp((x-rs)/fi,0,1);if(x>re-fo)v=Math.min(v,G*clamp((re-x)/fo,0,1));return v};
-  g.gain.setValueAtTime(env(st),when);
-  for(const p of [rs+fi,re-fo,re]){if(p>st)g.gain.linearRampToValueAtTime(env(p),t0+(p-from))}
-  const s=ctx.createBufferSource();s.buffer=ab;s.connect(g);g.connect(chainIn);s.start(when,Math.max(0,bo),dur);list&&list.push(s)}
+// 느리게 연습: 음높이는 두고 길이만 늘림(WSOLA)
+async function stretch(x,rate,yieldy){const N=2048,Hs=N/2,Ha=Hs*rate,tol=256,L=Hs;
+  const outLen=Math.ceil(x.length/rate);const y=new Float32Array(outLen+N);const w=new Float32Array(N);for(let i=0;i<N;i++)w[i]=0.5-0.5*Math.cos(2*Math.PI*i/N);
+  let ip=0,nat=Hs;const frames=Math.ceil(outLen/Hs)+1;
+  for(let k=0;k<frames;k++){const op=k*Hs;
+    if(k>0){const tg=Math.round(k*Ha);let best=0;
+      if(nat+L<x.length){let bv=-Infinity;for(let d=-tol;d<=tol;d+=4){const st=tg+d;if(st<0||st+L>=x.length)continue;let v=0;for(let j=0;j<L;j+=8)v+=x[nat+j]*x[st+j];if(v>bv){bv=v;best=d}}}
+      ip=Math.max(0,tg+best)}
+    for(let i=0;i<N;i++){const si=ip+i,o=op+i;if(si>=x.length||o>=y.length)break;y[o]+=x[si]*w[i]}
+    nat=ip+Hs;
+    if(yieldy&&k%400===399)await new Promise(r=>setTimeout(r,0))}
+  return y.slice(0,outLen)}
+const stCache=new Map(); // 'id@rate' → 늘인 소리
+async function prepareRate(rate){if(rate>=0.999)return;const need=new Set();
+  for(const t of P.tracks)for(const c of usedTakes(t))if(BUF.get(c.buf)&&!stCache.has(c.buf+'@'+rate))need.add(c.buf);
+  if(!need.size)return;toast('느리게 들을 준비 중… (소리 '+need.size+'개)',30000);
+  for(const id of need){const b=BUF.get(id);stCache.set(id+'@'+rate,await stretch(b.data,rate,true))}
+  toast('준비 완료',900)}
+function abFor(ctx,id,rate){rate=rate||1;const b=BUF.get(id);if(!b)return null;const key=rate>=0.999?'1':String(rate);
+  if(ctx===ac){b.abs=b.abs||{};if(b.abs[key])return b.abs[key]}
+  const d=key==='1'?b.data:stCache.get(id+'@'+rate);if(!d)return null;
+  const ab=ctx.createBuffer(1,d.length,b.sr);ab.copyToChannel(d,0);if(ctx===ac)b.abs[key]=ab;return ab}
+// 클립 c 를 트랙 구간 [lo,hi) · 재생 구간 [from,to) 안에서, ctx 시각 t0(=타임라인 from)부터 rate 빠르기로 예약
+const XF=0.012; // 나눔 경계를 겹쳐 잇는 길이
+function schedClip(ctx,chainIn,c,t0,from,to,rate,lo,hi,list){
+  const rs=c.off+c.ts,re=c.off+c.te;
+  const ca=isFinite(lo)?lo-XF/2:-Infinity,cb=isFinite(hi)?hi+XF/2:Infinity;
+  const s0=Math.max(rs,ca,from),e0=Math.min(re,cb,to);if(e0<=s0+0.002)return;
+  const ab=abFor(ctx,c.buf,rate);if(!ab)return;
+  const G=dbToGain(c.gain||0),fi=Math.max(0.004,c.fi),fo=Math.max(0.004,c.fo);
+  const env=x=>{let v=Math.min(1,clamp((x-rs)/fi,0,1),clamp((re-x)/fo,0,1));
+    if(isFinite(ca))v=Math.min(v,clamp((x-ca)/XF,0,1));if(isFinite(cb))v=Math.min(v,clamp((cb-x)/XF,0,1));
+    if(isFinite(to))v=Math.min(v,clamp((to-x)/0.004,0,1));if(from>rs+0.001&&from>ca)v=Math.min(v,clamp((x-from)/0.004,0,1));
+    return G*v};
+  const T=x=>t0+(x-from)/rate;
+  const g=ctx.createGain();g.gain.setValueAtTime(env(s0),T(s0));
+  const pts=[rs+fi,re-fo,ca+XF,cb-XF,to-0.004,from+0.004,e0].filter(p=>isFinite(p)&&p>s0&&p<=e0).sort((a,b)=>a-b);
+  for(const p of pts)g.gain.linearRampToValueAtTime(env(p),T(p));
+  const s=ctx.createBufferSource();s.buffer=ab;s.connect(g);g.connect(chainIn);
+  s.start(T(s0),Math.max(0,(c.ts+(s0-rs))/rate),(e0-s0)/rate);
+  if(list){list.push(s);s.onended=()=>{const i=list.indexOf(s);if(i>=0)list.splice(i,1);try{g.disconnect()}catch(e){}}}}
 
 function latency(){if(S.lat!=null)return S.lat/1000;if(!ac)return 0.12;return (ac.baseLatency||0.01)+(ac.outputLatency||0.04)+0.03}
 
 /* 메트로놈 */
-let metro=null;
 function clickAt(t,acc,vol){const o=ac.createOscillator(),g=ac.createGain();o.frequency.value=acc?1760:1180;o.type='sine';
   g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime((acc?0.9:0.6)*vol,t+0.002);g.gain.exponentialRampToValueAtTime(0.0001,t+0.05);
   o.connect(g);g.connect(ac.destination);o.start(t);o.stop(t+0.06)}
-function metroTick(){if(!metro)return;const ahead=ac.currentTime+0.18;
-  while(metro.next<ahead){const n=metro.n;const acc=((n%P.beats)+P.beats)%P.beats===0;
-    if(n<0||metro.on)clickAt(Math.max(metro.next,ac.currentTime),acc,S.metroVol);
-    if(n<0)showCount(-n,metro.next);
-    metro.n++;metro.next=metro.t0+(metro.n*metro.spb-metro.from)}}
-function showCount(k,t){const ms=Math.max(0,(t-ac.currentTime)*1000);setTimeout(()=>{const el=$('#countBig');if(!recording&&!playing)return;el.hidden=false;el.textContent=k;clearTimeout(showCount.h);showCount.h=setTimeout(()=>el.hidden=true,Math.min(400,metro?metro.spb*900:400))},ms)}
+function showCount(k,t){const ms=Math.max(0,(t-ac.currentTime)*1000);setTimeout(()=>{const el=$('#countBig');if(!recording&&!playing)return;el.hidden=false;el.textContent=k;clearTimeout(showCount.h);showCount.h=setTimeout(()=>el.hidden=true,Math.min(400,60/P.bpm*900))},ms)}
 
-function startPlay(from,t0,countBeats){ensureAC();syncChains();stopSources();
+/* 재생: 반복 구간이면 회차(seg)마다 이어서 예약 */
+let PL=null;
+function startPlay(from,t0,countBeats,rate){ensureAC();syncChains();stopSources();
+  rate=rate||1;const L=P.loop;const lp=L.on&&L.b>L.a+0.05?{a:L.a,b:L.b}:null;
+  if(lp&&(from<lp.a-1e-6||from>=lp.b-0.02))from=lp.a;
   playFrom=from;playT0=t0;
-  for(const t of P.tracks){const c=takeOf(t);if(!c)continue;const ch=CH.get(t.id);schedClip(ac,ch.in,c,t0,from,srcs)}
-  const spb=60/P.bpm;const first=Math.ceil(from/spb-1e-6);
-  metro={t0,from,spb,on:P.metro,n:first-(countBeats||0),next:0};
-  metro.next=t0+(metro.n*spb-from);
-  clearInterval(startPlay.iv);startPlay.iv=setInterval(metroTick,25);metroTick();
-  playing=true;updTransport()}
-function stopSources(){for(const s of srcs){try{s.stop()}catch(e){}}srcs=[]}
-function stopPlay(keep){stopSources();clearInterval(startPlay.iv);metro=null;playing=false;$('#countBig').hidden=true;if(!keep)pos=playFrom;updTransport();dirty=true}
-function curTime(){if(!playing)return pos;return playFrom+(ac.currentTime-(ac.outputLatency||0)-playT0)}
-function togglePlay(){if(recording){stopRec();return}if(playing){stopPlay();return}ensureAC();startPlay(pos,ac.currentTime+0.06,0)}
+  PL={t0,rate,lp,segs:[{t:t0,from,to:lp?lp.b:Infinity,sch:false}],mi:0,mn:Math.ceil(from/(60/P.bpm)-1e-6)};
+  const cb=countBeats||0,spbC=60/P.bpm/rate;
+  for(let k=cb;k>=1;k--){const t=t0-k*spbC;clickAt(Math.max(t,ac.currentTime),(cb-k)%P.beats===0,S.metroVol);showCount(k,t)}
+  clearInterval(startPlay.iv);startPlay.iv=setInterval(playTick,25);playing=true;playTick();updTransport()}
+function playTick(){if(!PL)return;const now=ac.currentTime,ahead=now+0.5;let s=PL.segs[PL.segs.length-1];
+  while(PL.lp&&s.t+(s.to-s.from)/PL.rate<ahead){s={t:s.t+(s.to-s.from)/PL.rate,from:PL.lp.a,to:PL.lp.b,sch:false};PL.segs.push(s)}
+  for(const sg of PL.segs){if(sg.sch||sg.t>ahead)continue;sg.sch=true;
+    for(const t of P.tracks){const ch=CH.get(t.id);if(!ch)continue;for(const q of segs(t))if(q.c)schedClip(ac,ch.in,q.c,sg.t,sg.from,sg.to,PL.rate,q.a,q.b,srcs)}}
+  const spb=60/P.bpm,ah=now+0.18;
+  for(let guard=0;guard<64;guard++){const sg=PL.segs[PL.mi];if(!sg)break;const x=PL.mn*spb;
+    if(x>=sg.to-1e-6){const nx=PL.segs[PL.mi+1];if(!nx)break;PL.mi++;PL.mn=Math.ceil(nx.from/spb-1e-6);continue}
+    const t=sg.t+(x-sg.from)/PL.rate;if(t>ah)break;
+    if(P.metro)clickAt(Math.max(t,now),((PL.mn%P.beats)+P.beats)%P.beats===0,S.metroVol);PL.mn++}
+  while(PL.segs.length>3&&PL.mi>1&&PL.segs[0].sch&&PL.segs[0].t+(PL.segs[0].to-PL.segs[0].from)/PL.rate<now-1){PL.segs.shift();PL.mi--}}
+function stopSources(){for(const s of srcs.slice()){try{s.onended=null;s.stop()}catch(e){}}srcs=[]}
+function stopPlay(keep){stopSources();clearInterval(startPlay.iv);PL=null;playing=false;$('#countBig').hidden=true;if(!keep)pos=playFrom;updTransport();dirty=true}
+function curTime(){if(!playing||!PL)return pos;const e=ac.currentTime-(ac.outputLatency||0);let sg=PL.segs[0];for(const q of PL.segs){if(q.t<=e)sg=q;else break}
+  return Math.min(sg.from+(e-sg.t)*PL.rate,sg.to)}
+async function togglePlay(){if(recording){stopRec();return}if(playing){stopPlay();return}ensureAC();const r=P.rate||1;if(r<1)await prepareRate(r);if(playing||recording)return;startPlay(pos,ac.currentTime+0.06,0,r)}
 
 /* ───────── 마이크 ───────── */
 let mic=null; // {stream,src,node,an,mon}
@@ -426,7 +483,7 @@ function updMicLabel(){$('#inTxt').textContent=mic?'입력':'마이크 꺼짐'}
 function openNoMic(msg){openSheet(`<h3>마이크를 쓸 수 없어요</h3><p>${esc(msg)}</p><div class="row" style="margin-top:12px"><button class="btn pri" data-close>확인</button></div>`)}
 
 /* ───────── 녹음 ───────── */
-let recTrackId=null,recFrom=0,recT0=0,wakeLock=null;
+let recTrackId=null,recFrom=0,recT0=0,wakeLock=null,recPL=null;
 async function startRec(){
   if(recording)return stopRec();
   if(playing)stopPlay();
@@ -435,29 +492,39 @@ async function startRec(){
   armed=t.id;
   const m=await ensureMic();if(!m)return;
   if(S.lat==null&&!S.seen.lat){S.seen.lat=1;saveS();toast('설정에서 "지연 재기"를 한 번 해 두면 겹쳐 녹음한 소리가 더 정확히 맞습니다',4200)}
-  else if(P.tracks.some(x=>x.id!==t.id&&takeOf(x))&&!S.seen.ear){S.seen.ear=1;saveS();toast('앞 트랙을 들으며 녹음할 땐 유선 이어폰을 끼세요',3800)}
-  recTrackId=t.id;recFrom=pos;recChunks=[];livePeaks=mkLive(t.id);
+  else if(P.tracks.some(x=>x.id!==t.id&&usedTakes(x).length)&&!S.seen.ear){S.seen.ear=1;saveS();toast('앞 트랙을 들으며 녹음할 땐 유선 이어폰을 끼세요',3800)}
+  else if(P.rate<1)toast('녹음은 원래 빠르기로 합니다',2500);
+  recTrackId=t.id;recChunks=[];livePeaks=mkLive(t.id);
   const spb=60/P.bpm;const cb=P.countIn?S.countBars*P.beats:0;
   recT0=ac.currentTime+0.12+cb*spb;
   m.node.port.postMessage(true);recording=true;
-  startPlay(recFrom,recT0,cb);
+  startPlay(pos,recT0,cb,1);recFrom=playFrom;recPL=PL;
   try{wakeLock=await navigator.wakeLock?.request('screen')}catch(e){}
   updTransport();renderHeaders();dirty=true}
-async function stopRec(){if(!recording)return;
+// 반복 녹음의 회차들(시각은 계산으로: 재생 쪽 목록은 지나간 회차를 버림)
+function recIters(lp,until){const its=[];let tt=recT0,fr=recFrom;while(tt<until&&its.length<500){its.push({t:tt,from:fr,to:lp.b});tt+=lp.b-fr;fr=lp.a}return its}
+async function stopRec(){if(!recording)return;const tStop=ac.currentTime;const lp=recPL&&recPL.lp;
   const done=new Promise(r=>{recDone=r;setTimeout(r,800)});mic.node.port.postMessage(false);await done;recDone=null;
-  recording=false;stopPlay(true);pos=recFrom;syncChains();livePeaks=null;try{wakeLock&&wakeLock.release()}catch(e){}wakeLock=null;
+  recording=false;stopPlay(true);pos=recFrom;syncChains();livePeaks=null;recPL=null;try{wakeLock&&wakeLock.release()}catch(e){}wakeLock=null;
   const t=trk(recTrackId);const ch=recChunks;recChunks=[];
   if(!t||!ch.length){updTransport();dirty=true;return}
-  const sr=ac.sampleRate;const f0=ch[0].f;const last=ch[ch.length-1];const len=last.f+last.d.length-f0;
+  const sr=ac.sampleRate,lat=latency();const f0=ch[0].f;const last=ch[ch.length-1];const len=last.f+last.d.length-f0;
   const data=new Float32Array(len);for(const c of ch){const o=c.f-f0;if(o>=0&&o+c.d.length<=len)data.set(c.d,o)}
-  const off=recFrom+(f0/sr-recT0)-latency();
-  const clip={buf:uid(),off,ts:Math.max(0,recFrom-off),te:len/sr,fi:0.01,fo:0.03,gain:0,at:Date.now()};
-  if(clip.te-clip.ts<0.25){toast('녹음이 너무 짧아 버렸습니다');updTransport();dirty=true;return}
-  await addBuffer(clip.buf,sr,data);
-  pushUndo();t.takes.push(clip);t.active=t.takes.length-1;selT=t.id;selClip=true;
-  let pk=0;for(let i=Math.floor(clip.ts*sr);i<len;i++){const a=Math.abs(data[i]);if(a>pk)pk=a}
+  const news=[];
+  if(lp){const mg=0.3,its=recIters(lp,tStop);
+    its.forEach(it=>{const dur=it.to-it.from,got=Math.min(tStop,it.t+dur)-it.t;if(its.length>1&&got<Math.min(1,dur*0.5))return;
+      const s0=Math.max(0,Math.floor((it.t-mg+lat)*sr)-f0),e0=Math.min(len,Math.ceil((it.t+dur+mg+lat)*sr)-f0);if(e0-s0<sr*0.25)return;
+      const x0=it.from+((f0+s0)/sr-lat-it.t);
+      news.push({data:data.slice(s0,e0),clip:{off:x0,ts:Math.max(0,it.from-x0),te:Math.min((e0-s0)/sr,it.to-x0),fi:0.01,fo:0.03,gain:0,at:Date.now()}})})}
+  else{const off=recFrom+(f0/sr-recT0)-lat;const clip={off,ts:Math.max(0,recFrom-off),te:len/sr,fi:0.01,fo:0.03,gain:0,at:Date.now()};
+    if(clip.te-clip.ts>=0.25)news.push({data,clip})}
+  if(!news.length){toast('녹음이 너무 짧아 버렸습니다');updTransport();dirty=true;return}
+  pushUndo();let pk=0;
+  for(const n of news){n.clip.buf=uid();await addBuffer(n.clip.buf,sr,n.data);t.takes.push(n.clip);
+    for(let i=Math.floor(n.clip.ts*sr);i<n.data.length;i++){const a=n.data[i]<0?-n.data[i]:n.data[i];if(a>pk)pk=a}}
+  useNewTake(t,t.takes.length-1);
   syncChains();renderAll();touch();
-  toast(pk>0.98?'소리가 너무 커서 깨졌을 수 있어요. 마이크와 조금 떨어져 다시 녹음해 보세요':pk<0.02?'소리가 아주 작게 녹음됐어요. 마이크 위치를 확인해 보세요':'테이크 '+t.takes.length+' 녹음 완료',3200)}
+  toast(pk>0.98?'소리가 너무 커서 깨졌을 수 있어요. 마이크와 조금 떨어져 다시 녹음해 보세요':pk<0.02?'소리가 아주 작게 녹음됐어요. 마이크 위치를 확인해 보세요':news.length>1?'반복 녹음 '+news.length+'번 → 테이크 '+news.length+'개가 쌓였습니다':'테이크 '+t.takes.length+' 녹음 완료',3400)}
 async function addBuffer(id,sr,data){const b={sr,data,peaks:mkPeaks(data)};BUF.set(id,b);try{await idb.put('buffers',{id,pid:P.id,sr,data})}catch(e){toast('녹음을 저장하지 못했습니다(저장 공간 확인): '+e.message,5000)}}
 function mkPeaks(d){const n=Math.ceil(d.length/256);const p=new Float32Array(n*2);for(let i=0;i<n;i++){let mn=0,mx=0;const e=Math.min(d.length,(i+1)*256);for(let j=i*256;j<e;j++){const v=d[j];if(v<mn)mn=v;if(v>mx)mx=v}p[2*i]=mn;p[2*i+1]=mx}return p}
 function mkLive(tid){const L={tid,f0:null,mins:[],maxs:[],acc:0,mn:0,mx:0,cnt:0,
@@ -492,10 +559,12 @@ function readColors(){const cs=getComputedStyle(document.documentElement);for(co
 function sizeCanvas(c,h){const dpr=window.devicePixelRatio||1;const w=c.clientWidth;if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);c.style.height=h+'px'}return{w,h,dpr}}
 function laneH(){return col.laneH}
 function lanesHeight(){return P.tracks.length*laneH()+56}
-function draw(){if(!P)return;
+function draw(){if(!P)return;const L=P.loop,hasL=L.b>L.a+0.01;
   // 자
   {const {w,h,dpr}=sizeCanvas(cR,28);const g=cR.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);
     const spb=60/P.bpm,bar=spb*P.beats;const pps=view.pps;
+    if(hasL){const xa=(L.a-view.x0)*pps,xb=(L.b-view.x0)*pps;g.fillStyle=L.on?col.acc+'3a':col.grid;g.fillRect(xa,0,xb-xa,h);
+      if(L.on){g.fillStyle=col.acc;g.fillRect(xa-1,0,3,h);g.fillRect(xb-2,0,3,h);g.beginPath();g.moveTo(xa,h);g.lineTo(xa+9,h);g.lineTo(xa,h-9);g.fill();g.beginPath();g.moveTo(xb,h);g.lineTo(xb-9,h);g.lineTo(xb,h-9);g.fill()}}
     const step=pps*bar<34?Math.ceil(34/(pps*bar)):1;
     g.font='500 11px '+getComputedStyle(document.body).getPropertyValue('--f-num');g.textBaseline='middle';
     const b0=Math.floor(view.x0/bar),b1=Math.ceil((view.x0+w/pps)/bar);
@@ -506,41 +575,47 @@ function draw(){if(!P)return;
   const H=Math.max(lanesHeight(),$('#scroller').clientHeight);const {w,dpr}=sizeCanvas(cL,H);const g=cL.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,H);
   const LH=laneH(),pps=view.pps,spb=60/P.bpm,bar=spb*P.beats;
   P.tracks.forEach((t,i)=>{g.fillStyle=i%2?col.lane2:col.lane;g.fillRect(0,i*LH,w,LH);g.fillStyle=col.line;g.fillRect(0,(i+1)*LH-1,w,1)});
-  // 격자
   const b0=Math.floor(view.x0/bar),b1=Math.ceil((view.x0+w/pps)/bar),gh=P.tracks.length*LH;
   for(let b=b0;b<=b1;b++){const x=(b*bar-view.x0)*pps;g.fillStyle=col.grid2;g.fillRect(Math.round(x),0,1,gh);
     if(pps*spb>14){g.fillStyle=col.grid;for(let k=1;k<P.beats;k++)g.fillRect(Math.round(x+k*spb*pps),0,1,gh)}}
+  if(hasL&&L.on){const xa=(L.a-view.x0)*pps,xb=(L.b-view.x0)*pps;g.fillStyle=col.acc+'14';g.fillRect(xa,0,xb-xa,gh);g.fillStyle=col.acc+'aa';g.fillRect(Math.round(xa),0,1,gh);g.fillRect(Math.round(xb),0,1,gh)}
   const anySolo=P.tracks.some(x=>x.solo);
-  P.tracks.forEach((t,i)=>{const c=takeOf(t);const y=i*LH;const tc=(INST[t.inst]||INST.other).color;const dim=t.mute||(anySolo&&!t.solo);
-    if(c)drawClip(g,c,t,y,LH,w,tc,dim,t.id===selT&&selClip);
-    if(livePeaks&&livePeaks.tid===t.id&&livePeaks.f0!=null&&ac){drawLive(g,y,LH,w)}});
-  // 재생선
+  P.tracks.forEach((t,i)=>{const y=i*LH;const tc=(INST[t.inst]||INST.other).color;const dim=t.mute||(anySolo&&!t.solo);const isSel=t.id===selT&&selClip,si=segIdx(t);
+    for(const sg of segs(t)){if(sg.c)drawClip(g,sg.c,t,y,LH,w,tc,dim,isSel&&sg.i===si,sg);
+      else if(isSel&&sg.i===si&&t.cuts.length){const xa=Math.max(0,(Math.max(sg.a,0)-view.x0)*pps),xb=isFinite(sg.b)?(sg.b-view.x0)*pps:w;
+        g.save();g.setLineDash([5,4]);g.strokeStyle=col.ink;g.lineWidth=1.5;g.strokeRect(xa+1,y+6,Math.max(0,xb-xa-2),LH-12);g.restore();g.fillStyle=col.mut;g.font='600 11px system-ui';g.fillText('비움',xa+8,y+LH/2+4)}}
+    t.cuts.forEach(cx=>{const x=Math.round((cx-view.x0)*pps)+.5;if(x<-10||x>w+10)return;g.save();g.setLineDash([3,3]);g.strokeStyle=t.id===selT?col.ink:col.mut;g.lineWidth=1;g.beginPath();g.moveTo(x,y+2);g.lineTo(x,y+LH-2);g.stroke();g.restore();
+      g.fillStyle=t.id===selT?col.ink:col.mut;roundRect(g,x-6,y+3,12,15,3);g.fill()});
+    if(livePeaks&&livePeaks.tid===t.id&&livePeaks.f0!=null&&ac)drawLive(g,y,LH,w)});
   const px=(curTime()-view.x0)*pps;g.fillStyle=recording?col.rec:col.acc;g.fillRect(Math.round(px)-.5,0,1.5,H);
   dirty=false}
-function drawClip(g,c,t,y,LH,W,tc,dim,sel){const b=BUF.get(c.buf);const pps=view.pps;
-  const rs=c.off+c.ts,re=c.off+c.te;const xl=(rs-view.x0)*pps,xr=(re-view.x0)*pps;if(xr<0||xl>W)return;
+function drawClip(g,c,t,y,LH,W,tc,dim,sel,sg){const b=BUF.get(c.buf);const pps=view.pps;
+  const rs=c.off+c.ts,re=c.off+c.te,[vs,ve]=clipSpan(c,sg);if(ve<=vs)return;const lE=rs>=sg.a,rE=re<=sg.b;
+  const xl=(vs-view.x0)*pps,xr=(ve-view.x0)*pps;if(xr<0||xl>W)return;
   const top=y+5,hh=LH-10,mid=top+hh/2;
   g.globalAlpha=dim?0.35:1;
-  g.fillStyle=tc+'2a';roundRect(g,xl,top,xr-xl,hh,6);g.fill();
+  g.fillStyle=tc+'2a';roundRect(g,xl,top,xr-xl,hh,lE&&rE?6:2);g.fill();
   g.fillStyle=tc+'d0';g.fillRect(Math.max(xl,-2),top,Math.min(xr,W+2)-Math.max(xl,-2),3);
   if(b){const sr=b.sr,pk=b.peaks,nb=pk.length/2,G=dbToGain(c.gain||0);g.fillStyle=tc;
     const xa=Math.max(Math.floor(xl),0),xb=Math.min(Math.ceil(xr),W);
     for(let x=xa;x<xb;x++){const tt=view.x0+x/pps-c.off;let i0=Math.floor(tt*sr/256),i1=Math.floor((tt+1/pps)*sr/256);if(i1<=i0)i1=i0+1;if(i0>=nb||i1<0)continue;
       let mn=0,mx=0;const lim=Math.min(i1,nb,i0+64);for(let k=Math.max(0,i0);k<lim;k++){if(pk[2*k]<mn)mn=pk[2*k];if(pk[2*k+1]>mx)mx=pk[2*k+1]}
       const a=Math.sqrt(Math.min(1,-mn*G))*hh*0.46,bb=Math.sqrt(Math.min(1,mx*G))*hh*0.46;g.fillRect(x,mid-bb,1,Math.max(1,a+bb))}}
-  // 페이드
   g.fillStyle=col.bg+'99';const fiw=c.fi*pps,fow=c.fo*pps;
-  if(fiw>1.5){g.beginPath();g.moveTo(xl,top);g.lineTo(xl+fiw,top);g.lineTo(xl,top+hh);g.closePath();g.fill()}
-  if(fow>1.5){g.beginPath();g.moveTo(xr,top);g.lineTo(xr-fow,top);g.lineTo(xr,top+hh);g.closePath();g.fill()}
+  if(lE&&fiw>1.5){g.beginPath();g.moveTo(xl,top);g.lineTo(xl+fiw,top);g.lineTo(xl,top+hh);g.closePath();g.fill()}
+  if(rE&&fow>1.5){g.beginPath();g.moveTo(xr,top);g.lineTo(xr-fow,top);g.lineTo(xr,top+hh);g.closePath();g.fill()}
   g.globalAlpha=1;
-  if(t.takes.length>1){g.font='600 10px system-ui';g.fillStyle=col.mut;g.fillText('테이크 '+(t.active+1)+'/'+t.takes.length,Math.max(xl,0)+6,top+15)}
-  if(sel){g.strokeStyle=col.ink;g.lineWidth=2;roundRect(g,xl,top,xr-xl,hh,6);g.stroke();
-    g.fillStyle=col.ink;g.fillRect(xl-3,mid-14,6,28);g.fillRect(xr-3,mid-14,6,28);
-    g.beginPath();g.arc(xl+Math.max(fiw,8),top+6,6,0,7);g.fill();g.beginPath();g.arc(xr-Math.max(fow,8),top+6,6,0,7);g.fill()}}
-function drawLive(g,y,LH,W){const L=livePeaks,sr=ac.sampleRate,pps=view.pps;const start=recFrom+(L.f0/sr-recT0)-latency();const top=y+5,hh=LH-10,mid=top+hh/2;
-  g.fillStyle=col.rec+'22';const xs=(Math.max(start,recFrom)-view.x0)*pps,xe=(start+L.mins.length*256/sr-view.x0)*pps;if(xe>xs)g.fillRect(xs,top,xe-xs,hh);
-  g.fillStyle=col.rec;const n=L.mins.length;
-  for(let x=Math.max(0,Math.floor(xs));x<Math.min(W,xe);x++){const tt=view.x0+x/pps-start;const i0=Math.floor(tt*sr/256);let i1=Math.floor((tt+1/pps)*sr/256);if(i1<=i0)i1=i0+1;
+  if(t.takes.length>1&&xr-xl>56){g.font='600 10px system-ui';g.fillStyle=col.mut;g.fillText('테이크 '+(sg.k+1)+'/'+t.takes.length,Math.max(xl,0)+(sg.i?10:6),top+15)}
+  if(sel){g.strokeStyle=col.ink;g.lineWidth=2;roundRect(g,xl,top,xr-xl,hh,lE&&rE?6:2);g.stroke();g.fillStyle=col.ink;
+    if(lE){g.fillRect(xl-3,mid-14,6,28);g.beginPath();g.arc(xl+Math.max(fiw,8),top+6,6,0,7);g.fill()}
+    if(rE){g.fillRect(xr-3,mid-14,6,28);g.beginPath();g.arc(xr-Math.max(fow,8),top+6,6,0,7);g.fill()}}}
+function drawLive(g,y,LH,W){const L=livePeaks,sr=ac.sampleRate,pps=view.pps,lat=latency();const top=y+5,hh=LH-10,mid=top+hh/2;
+  const lp=recPL&&recPL.lp;let it={t:recT0,from:recFrom,to:lp?lp.b:Infinity};
+  if(lp){const now=ac.currentTime;while(it.t+(it.to-it.from)<=now)it={t:it.t+(it.to-it.from),from:lp.a,to:lp.b}}
+  const n=L.mins.length;const endX=Math.min(it.to,it.from+(L.f0/sr+n*256/sr-lat-it.t));
+  const xs=(it.from-view.x0)*pps,xe=(endX-view.x0)*pps;if(xe<=xs)return;
+  g.fillStyle=col.rec+'22';g.fillRect(xs,top,xe-xs,hh);g.fillStyle=col.rec;
+  for(let x=Math.max(0,Math.floor(xs));x<Math.min(W,xe);x++){const tl=view.x0+x/pps;const fr=(it.t+(tl-it.from)+lat)*sr-L.f0;const i0=Math.floor(fr/256);let i1=Math.floor((fr+sr/pps)/256);if(i1<=i0)i1=i0+1;
     let mn=0,mx=0;for(let k=Math.max(0,i0);k<Math.min(i1,n);k++){if(L.mins[k]<mn)mn=L.mins[k];if(L.maxs[k]>mx)mx=L.maxs[k]}
     const a=Math.sqrt(Math.min(1,-mn))*hh*0.46,b=Math.sqrt(Math.min(1,mx))*hh*0.46;g.fillRect(x,mid-b,1,Math.max(1,a+b))}}
 function roundRect(g,x,y,w,h,r){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath()}
@@ -559,12 +634,18 @@ function renderHeaders(){const h=$('#hdrs');const anySolo=P.tracks.some(x=>x.sol
       <div class="hb"><button class="arm" data-act="arm" aria-pressed="${t.id===armed}" title="녹음할 트랙">●</button><button class="mu" data-act="mute" aria-pressed="${t.mute}" title="소리 끄기">M</button><button class="so" data-act="solo" aria-pressed="${t.solo}" title="이 트랙만 듣기">S</button></div></div>`}).join('')+
     `<div class="addRow"><button data-act="add">+ 트랙 추가</button></div>`;
   $('#empty').hidden=P.tracks.some(t=>t.takes.length)}
-function renderClipbar(){const t=trk(selT);const c=takeOf(t);const cb=$('#clipbar');if(!c||!selClip||$('#vMixer').hidden===false){cb.hidden=true;return}
-  cb.hidden=false;$('#cbName').textContent=t.name;$('#cbTake').textContent=(t.active+1)+'/'+t.takes.length;
-  $('#cbGain').value=c.gain||0;$('#cbGainV').textContent=(c.gain>0?'+':'')+(+c.gain||0).toFixed(1)+'dB';
-  $('#cbPrev').disabled=t.active<=0;$('#cbNext').disabled=t.active>=t.takes.length-1}
+function takeOpts(t){const o=t.takes.map((_,i)=>i);if(t.cuts.length)o.push(-1);return o}
+function renderClipbar(){const t=trk(selT);const cb=$('#clipbar');if(!t||!selClip||!t.takes.length||$('#vMixer').hidden===false){cb.hidden=true;return}
+  const s=segIdx(t),k=t.pick[s],c=t.takes[k]||null;cb.hidden=false;
+  $('#cbName').textContent=t.name+(t.cuts.length?' · 구간 '+(s+1)+'/'+(t.cuts.length+1):'');
+  $('#cbTake').textContent=c?(k+1)+'/'+t.takes.length:'비움';
+  const o=takeOpts(t),oi=o.indexOf(c?k:-1);$('#cbPrev').disabled=oi<=0;$('#cbNext').disabled=oi>=o.length-1;
+  $('#cbJoin').hidden=!t.cuts.length;
+  for(const id of ['cbClean','cbL','cbR','cbGain','cbDel'])$('#'+id).disabled=!c;
+  $('#cbGain').value=c?c.gain||0:0;$('#cbGainV').textContent=c?fDb(c.gain||0)+'dB':'–'}
 function renderTop(){$('#projName').textContent=P.name;$('#bpmV').textContent=P.bpm;$('#selBeats').value=P.beats;
-  $('#bMetro').setAttribute('aria-pressed',P.metro);$('#bCount').setAttribute('aria-pressed',P.countIn)}
+  $('#bMetro').setAttribute('aria-pressed',P.metro);$('#bCount').setAttribute('aria-pressed',P.countIn);
+  $('#bLoop').setAttribute('aria-pressed',!!P.loop.on);$('#selRate').value=String(P.rate||1)}
 function renderAll(){renderTop();renderHeaders();renderClipbar();if(!$('#vMixer').hidden)renderMixer();dirty=true}
 
 /* 믹서 */
@@ -586,7 +667,8 @@ function renderMixer(){const s=$('#strips');const anySolo=P.tracks.some(x=>x.sol
     <div class="knob"><label for="mRoom"><span>울림 공간</span></label><select id="mRoom" class="tg" style="height:30px;font-size:12px;padding:0 6px">${Object.entries(ROOMS).map(([k,r])=>`<option value="${k}"${P.master.room===k?' selected':''}>${r.name}</option>`).join('')}</select></div>
     <p style="font-size:10px;color:var(--mut);margin:2px 0">각 트랙의 리버브 양이 이 공간의 울림으로 들어갑니다.</p>
     <div class="faderBox"><input type="range" id="fdM" min="-30" max="6" step="0.5" value="${P.master.vol}" aria-label="전체 볼륨"><span class="meter"><i id="mtM"></i></span></div>
-    <div class="db" id="fdMo">${fDb(P.master.vol)}dB</div></div>`;
+    <div class="db" id="fdMo">${fDb(P.master.vol)}dB</div>
+    <button class="tg" data-act="autolevel" style="height:auto;min-height:32px;padding:4px 6px;font-size:11px;justify-content:center;white-space:normal;line-height:1.25">트랙 음량 자동 맞춤</button></div>`;
   if(!P.tracks.length)s.insertAdjacentHTML('afterbegin','<div class="note" style="align-self:flex-start;max-width:260px">트랙을 녹음하면 여기서 악기마다 소리 크기, 좌우 위치, 음색, 울림을 맞출 수 있습니다.</div>')}
 let mixUndoArmed=false;
 $('#strips').addEventListener('pointerdown',()=>{mixUndoArmed=true});
@@ -600,7 +682,7 @@ $('#strips').addEventListener('input',e=>{const el=e.target;if(el.type!=='range'
   syncChains();touch()});
 $('#strips').addEventListener('change',e=>{if(e.target.id==='mRoom'){P.master.room=e.target.value;syncChains();touch()}});
 $('#strips').addEventListener('dblclick',e=>{const el=e.target;if(el.type!=='range')return;pushUndo();el.value=el.id.startsWith('fd')?(el.id==='fdM'?0:-3):0;el.dispatchEvent(new Event('input',{bubbles:true}))});
-$('#strips').addEventListener('click',e=>{const b=e.target.closest('button[data-act]');if(!b)return;const id=b.closest('.strip').dataset.id;trackAct(b.dataset.act,id);renderMixer()});
+$('#strips').addEventListener('click',e=>{const b=e.target.closest('button[data-act]');if(!b)return;if(b.dataset.act==='autolevel'){autoLevelAll();return}const id=b.closest('.strip').dataset.id;trackAct(b.dataset.act,id);renderMixer()});
 function meters(){if(!ac)return;const buf=new Float32Array(256);const lv=an=>{an.getFloatTimeDomainData(buf);let p=0;for(let i=0;i<256;i++){const a=Math.abs(buf[i]);if(a>p)p=a}return p};
   const h=v=>Math.round(clamp((20*Math.log10(v+1e-6)+48)/48,0,1)*100)+'%';
   for(const t of P.tracks){const c=CH.get(t.id),el=document.getElementById('mt_'+t.id);if(c&&el)el.style.height=h(lv(c.an))}
@@ -621,24 +703,28 @@ $('#hdrs').addEventListener('click',e=>{const b=e.target.closest('[data-act]');c
 /* ───────── 레인 터치 ───────── */
 const ptr=new Map();let drag=null;
 function cpos(e,c){const r=c.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}}
-function hit(x,y){const LH=laneH();const i=Math.floor(y/LH);const t=P.tracks[i];if(!t)return null;const c=takeOf(t);if(!c)return{t};
-  const pps=view.pps,xl=(c.off+c.ts-view.x0)*pps,xr=(c.off+c.te-view.x0)*pps,top=i*LH+5;
-  if(t.id===selT&&selClip){const fx=xl+Math.max(c.fi*pps,8),gx=xr-Math.max(c.fo*pps,8);
-    if(y<top+20){if(Math.abs(x-fx)<16)return{t,c,mode:'fi'};if(Math.abs(x-gx)<16)return{t,c,mode:'fo'}}
-    if(Math.abs(x-xl)<16)return{t,c,mode:'tl'};if(Math.abs(x-xr)<16)return{t,c,mode:'tr'}}
-  if(x>=xl&&x<=xr)return{t,c,mode:'mv'};return{t}}
+function hit(x,y){const LH=laneH();const i=Math.floor(y/LH);const t=P.tracks[i];if(!t)return null;const pps=view.pps,tm=view.x0+x/pps,top=i*LH+5;
+  if(y<top+16)for(let j=0;j<t.cuts.length;j++){if(Math.abs((t.cuts[j]-view.x0)*pps-x)<14)return{t,mode:'cut',j}}
+  const s=segAt(t,tm),sg=segs(t)[s],c=sg.c;if(!c)return{t,s};
+  const rs=c.off+c.ts,re=c.off+c.te,[vs,ve]=clipSpan(c,sg),xl=(vs-view.x0)*pps,xr=(ve-view.x0)*pps;
+  if(t.id===selT&&selClip&&s===segIdx(t)){const lE=rs>=sg.a,rE=re<=sg.b;const fx=xl+Math.max(c.fi*pps,8),gx=xr-Math.max(c.fo*pps,8);
+    if(y<top+20){if(lE&&Math.abs(x-fx)<16)return{t,s,c,mode:'fi'};if(rE&&Math.abs(x-gx)<16)return{t,s,c,mode:'fo'}}
+    if(lE&&Math.abs(x-xl)<16)return{t,s,c,mode:'tl'};if(rE&&Math.abs(x-xr)<16)return{t,s,c,mode:'tr'}}
+  if(x>=xl&&x<=xr)return{t,s,c,mode:'mv'};return{t,s}}
 cL.addEventListener('pointerdown',e=>{if(!P)return;const p=cpos(e,cL);ptr.set(e.pointerId,p);try{cL.setPointerCapture(e.pointerId)}catch(_){}
   if(ptr.size===2){const [a,b]=[...ptr.values()];drag={mode:'pinch',d:Math.hypot(a.x-b.x,a.y-b.y),mx:(a.x+b.x)/2,pps:view.pps,x0:view.x0};return}
   if(ptr.size>2)return;
-  const h=hit(p.x,p.y);drag={sx:p.x,sy:p.y,moved:false,h,x0:view.x0,mode:h&&h.mode?h.mode:'pan',orig:h&&h.c?{...h.c}:null,undo:false};
+  const h=hit(p.x,p.y);drag={sx:p.x,sy:p.y,moved:false,h,x0:view.x0,mode:h&&h.mode?h.mode:'pan',orig:h&&h.c?{...h.c}:null,oc:h&&h.t?h.t.cuts.slice():null,undo:false};
   if(recording&&drag.mode!=='pan')drag.mode='pan'});
 cL.addEventListener('pointermove',e=>{if(!drag||!ptr.has(e.pointerId))return;const p=cpos(e,cL);ptr.set(e.pointerId,p);
   if(drag.mode==='pinch'){if(ptr.size<2)return;const [a,b]=[...ptr.values()];const d=Math.hypot(a.x-b.x,a.y-b.y);const pps=clamp(drag.pps*d/drag.d,3,600);const t=drag.x0+drag.mx/drag.pps;view.pps=pps;view.x0=Math.max(0,t-drag.mx/pps);dirty=true;return}
   const dx=p.x-drag.sx;if(!drag.moved&&Math.abs(dx)<7&&Math.abs(p.y-drag.sy)<7)return;
-  if(!drag.moved){drag.moved=true;if(drag.mode==='mv'&&!(drag.h.t.id===selT&&selClip)){selT=drag.h.t.id;selClip=true;renderHeaders();renderClipbar()}}
+  if(!drag.moved){drag.moved=true;const h=drag.h;if(drag.mode==='mv'&&!(h.t.id===selT&&selClip&&h.s===segIdx(h.t))){selT=h.t.id;selS=h.s;selClip=true;renderHeaders();renderClipbar()}}
   const pps=view.pps,dt=dx/pps;
   if(drag.mode==='pan'){view.x0=Math.max(0,drag.x0-dt);dirty=true;return}
-  const c=drag.h.c,o=drag.orig;if(!drag.undo){pushUndo();drag.undo=true}
+  if(!drag.undo){pushUndo();drag.undo=true}
+  if(drag.mode==='cut'){const t=drag.h.t,j=drag.h.j,o=drag.oc;const lo=j?o[j-1]+0.05:0.05,hi=j<o.length-1?o[j+1]-0.05:Infinity;t.cuts[j]=clamp(o[j]+dt,lo,hi);dirty=true;return}
+  const c=drag.h.c,o=drag.orig;
   if(drag.mode==='mv'){c.off=Math.max(-o.ts,o.off+dt)}
   else if(drag.mode==='tl'){c.ts=clamp(o.ts+dt,0,o.te-0.05);if(c.off+c.ts<0)c.ts=-c.off;c.fi=Math.min(c.fi,(c.te-c.ts)/2)}
   else if(drag.mode==='tr'){const b=BUF.get(c.buf);c.te=clamp(o.te+dt,o.ts+0.05,b?b.data.length/b.sr:o.te);c.fo=Math.min(c.fo,(c.te-c.ts)/2)}
@@ -647,31 +733,77 @@ cL.addEventListener('pointermove',e=>{if(!drag||!ptr.has(e.pointerId))return;con
   dirty=true});
 function endPtr(e){const had=ptr.delete(e.pointerId);if(!drag||!had)return;
   if(drag.mode==='pinch'){if(ptr.size===0){drag=null;touch()}return}
-  if(!drag.moved&&e.type==='pointerup'){const h=drag.h;
-    if(h&&h.c){if(h.t.id===selT&&selClip){if(!playing)setPos(view.x0+drag.sx/view.pps)}else{selT=h.t.id;selClip=true}}
-    else{if(h&&h.t)selT=h.t.id;selClip=false;if(!playing)setPos(view.x0+drag.sx/view.pps)}
+  if(!drag.moved&&e.type==='pointerup'){const h=drag.h,x=view.x0+drag.sx/view.pps;
+    if(h&&h.c){if(h.t.id===selT&&selClip&&h.s===segIdx(h.t)){if(!playing)setPos(x)}else{selT=h.t.id;selS=h.s;selClip=true}}
+    else if(h&&h.mode==='cut'){selT=h.t.id}
+    else{if(h&&h.t){selT=h.t.id;selS=h.s||0;selClip=!!(h.t.cuts.length&&h.t.takes.length)}else selClip=false;if(!playing)setPos(x)}
     renderHeaders();renderClipbar()}
-  else if(drag.undo){if(playing&&!recording){const was=curTime();stopPlay(true);startPlay(was,ac.currentTime+0.05,0)}touch()}
+  else if(drag.undo){if(playing&&!recording){const was=curTime();stopPlay(true);startPlay(was,ac.currentTime+0.05,0,P.rate)}renderClipbar();touch()}
   drag=null;dirty=true}
 cL.addEventListener('pointerup',endPtr);cL.addEventListener('pointercancel',endPtr);
 cL.addEventListener('wheel',e=>{if(e.ctrlKey){e.preventDefault();const p=cpos(e,cL);const t=view.x0+p.x/view.pps;view.pps=clamp(view.pps*Math.exp(-e.deltaY*0.002),3,600);view.x0=Math.max(0,t-p.x/view.pps);dirty=true}
   else if(Math.abs(e.deltaX)>Math.abs(e.deltaY)||e.shiftKey){e.preventDefault();view.x0=Math.max(0,view.x0+(e.deltaX||e.deltaY)/view.pps);dirty=true}},{passive:false});
 function setPos(t){pos=Math.max(0,t);dirty=true;updClock()}
-let rulerDrag=false;
-cR.addEventListener('pointerdown',e=>{if(recording)return;rulerDrag=true;try{cR.setPointerCapture(e.pointerId)}catch(_){}const was=playing;if(was)stopPlay(true);setPos(view.x0+cpos(e,cR).x/view.pps);rulerDrag={was}});
-cR.addEventListener('pointermove',e=>{if(rulerDrag)setPos(view.x0+cpos(e,cR).x/view.pps)});
-cR.addEventListener('pointerup',()=>{if(rulerDrag&&rulerDrag.was)startPlay(pos,ensureAC().currentTime+0.05,0);rulerDrag=false});
+function snapBeat(x){const spb=60/P.bpm;return Math.max(0,Math.round(x/spb)*spb)}
+let rulerDrag=null;
+cR.addEventListener('pointerdown',e=>{if(recording||!P)return;try{cR.setPointerCapture(e.pointerId)}catch(_){}const x=cpos(e,cR).x,L=P.loop;
+  if(L.on&&L.b>L.a){const da=Math.abs(x-(L.a-view.x0)*view.pps),db=Math.abs(x-(L.b-view.x0)*view.pps);if(Math.min(da,db)<16){rulerDrag={loop:da<=db?'a':'b'};return}}
+  const was=playing;if(was)stopPlay(true);setPos(view.x0+x/view.pps);rulerDrag={was}});
+cR.addEventListener('pointermove',e=>{if(!rulerDrag)return;const x=view.x0+cpos(e,cR).x/view.pps;
+  if(rulerDrag.loop){const L=P.loop,spb=60/P.bpm,v=snapBeat(x);if(rulerDrag.loop==='a')L.a=Math.min(v,L.b-spb);else L.b=Math.max(v,L.a+spb);dirty=true;updClock();return}setPos(x)});
+function rulerUp(){const r=rulerDrag;rulerDrag=null;if(!r)return;if(r.loop){touch();if(playing&&!recording){stopPlay(true);startPlay(P.loop.a,ac.currentTime+0.05,0,P.rate)}return}
+  if(r.was)startPlay(pos,ensureAC().currentTime+0.05,0,P.rate)}
+cR.addEventListener('pointerup',rulerUp);cR.addEventListener('pointercancel',rulerUp);
 function zoom(f){const W=cL.clientWidth;const c=playing?curTime():pos;const xr=clamp((c-view.x0)*view.pps,0,W)||W/2;view.pps=clamp(view.pps*f,3,600);view.x0=Math.max(0,c-xr/view.pps);dirty=true;touch()}
 
 /* 클립 막대 */
-function clipEdit(fn){const t=trk(selT),c=takeOf(t);if(!c)return;pushUndo();fn(t,c);renderClipbar();renderHeaders();dirty=true;touch()}
-$('#cbPrev').onclick=()=>clipEdit(t=>{t.active=Math.max(0,t.active-1)});
-$('#cbNext').onclick=()=>clipEdit(t=>{t.active=Math.min(t.takes.length-1,t.active+1)});
+function clipEdit(fn,needClip){const t=trk(selT);if(!t)return;const c=takeOf(t);if(needClip!==false&&!c)return;pushUndo();fn(t,c);renderClipbar();renderHeaders();dirty=true;touch()}
+$('#cbPrev').onclick=()=>clipEdit(t=>{const o=takeOpts(t),s=segIdx(t),i=o.indexOf(t.takes[t.pick[s]]?t.pick[s]:-1);t.pick[s]=o[Math.max(0,i-1)]},false);
+$('#cbNext').onclick=()=>clipEdit(t=>{const o=takeOpts(t),s=segIdx(t),i=o.indexOf(t.takes[t.pick[s]]?t.pick[s]:-1);t.pick[s]=o[Math.min(o.length-1,i+1)]},false);
+$('#cbSplit').onclick=()=>{const t=trk(selT);if(!t)return;const x=playing?curTime():pos;
+  if(x<=0.05){toast('재생선을 나눌 자리로 옮긴 뒤 누르세요');return}if(t.cuts.some(c=>Math.abs(c-x)<0.05)){toast('이미 나뉜 자리입니다');return}
+  clipEdit(t=>{const i=segAt(t,x);t.cuts.splice(i,0,x);t.pick.splice(i,0,t.pick[i]);selS=i+1;selClip=true},false);
+  if(!S.seen.split){S.seen.split=1;saveS();toast('나눈 구간마다 ◀ ▶ 로 다른 테이크를 고르거나 비울 수 있습니다',4000)}};
+$('#cbJoin').onclick=()=>clipEdit(t=>{const s=segIdx(t);if(!t.cuts.length)return;if(s>0){t.cuts.splice(s-1,1);t.pick.splice(s-1,1);selS=s-1}else{t.cuts.splice(0,1);t.pick.splice(1,1);selS=0}},false);
 $('#cbL').onclick=()=>clipEdit((t,c)=>{c.off-=0.01;if(c.off+c.ts<0)c.off=-c.ts});
 $('#cbR').onclick=()=>clipEdit((t,c)=>{c.off+=0.01});
+$('#cbClean').onclick=()=>cleanSheet();
 let gainUndo=true;$('#cbGain').addEventListener('pointerdown',()=>gainUndo=true);
-$('#cbGain').addEventListener('input',e=>{const t=trk(selT),c=takeOf(t);if(!c)return;if(gainUndo){pushUndo();gainUndo=false}c.gain=+e.target.value;$('#cbGainV').textContent=(c.gain>0?'+':'')+c.gain.toFixed(1)+'dB';dirty=true;touch()});
-$('#cbDel').onclick=()=>{const t=trk(selT);if(!t)return;confirmSheet(`'${t.name}'의 테이크 ${t.active+1}을(를) 지울까요?`,'되돌리기(↶)로 다시 살릴 수 있습니다.','지우기',()=>clipEdit(t=>{t.takes.splice(t.active,1);t.active=Math.max(0,Math.min(t.active,t.takes.length-1));if(!t.takes.length)selClip=false}))};
+$('#cbGain').addEventListener('input',e=>{const t=trk(selT),c=takeOf(t);if(!c)return;if(gainUndo){pushUndo();gainUndo=false}c.gain=+e.target.value;$('#cbGainV').textContent=fDb(c.gain)+'dB';dirty=true;touch()});
+$('#cbDel').onclick=()=>{const t=trk(selT);if(!t)return;const k=t.pick[segIdx(t)];if(!t.takes[k])return;
+  confirmSheet(`'${t.name}'의 테이크 ${k+1}을(를) 지울까요?`,'이 테이크를 쓰던 구간은 다른 테이크로 바뀝니다. 되돌리기(↶)로 다시 살릴 수 있습니다.','지우기',()=>clipEdit(t=>{removeTake(t,k);selClip=t.takes.length>0},false))};
+
+/* 소리 정리: 음량 맞추기(클립 크기만) · 잡음 줄이기(새 소리로 바꿈, 되돌리기 가능) */
+function analyze(d,sr,i0,i1){const W=Math.max(1,Math.floor(sr*0.05));const rms=[];let pk=0;
+  for(let i=i0;i<i1;i+=W){let s2=0;const e=Math.min(i1,i+W);for(let j=i;j<e;j++){const v=d[j];s2+=v*v;const a=v<0?-v:v;if(a>pk)pk=a}rms.push(Math.sqrt(s2/Math.max(1,e-i)))}
+  const so=rms.slice().sort((a,b)=>a-b);const floor=so[Math.floor(so.length*0.1)]||0,top=so[Math.floor(so.length*0.95)]||0;
+  const th=Math.max(floor*3,top*0.08);let ss=0,n=0;for(const r of rms)if(r>th){ss+=r*r;n++}return{pk,floor,top,th,act:n?Math.sqrt(ss/n):top}}
+function autoGainDb(c){const b=BUF.get(c.buf);if(!b)return c.gain||0;const i0=Math.floor(c.ts*b.sr),i1=Math.min(b.data.length,Math.floor(c.te*b.sr));if(i1-i0<b.sr*0.2)return c.gain||0;
+  const a=analyze(b.data,b.sr,i0,i1);if(a.act<1e-5)return c.gain||0;
+  let db=20*Math.log10(0.1/a.act);db=Math.min(db,20*Math.log10(0.89/Math.max(a.pk,1e-6)));return clamp(Math.round(db*2)/2,-24,18)}
+function autoLevelAll(){const list=[];for(const t of P.tracks)for(const c of usedTakes(t))list.push(c);if(!list.length){toast('맞출 녹음이 없습니다');return}
+  pushUndo();for(const c of list)c.gain=autoGainDb(c);renderAll();touch();toast('테이크 '+list.length+'개의 음량을 맞췄습니다. 악기 사이 크기는 믹서 페이더로 조절하세요',3800)}
+function hpf(d,sr,fc){const K=Math.tan(Math.PI*fc/sr),Q=Math.SQRT1_2,n=1/(1+K/Q+K*K);const b0=n,b1=-2*n,b2=n,a1=2*(K*K-1)*n,a2=(1-K/Q+K*K)*n;
+  const y=new Float32Array(d.length);let x1=0,x2=0,y1=0,y2=0;for(let i=0;i<d.length;i++){const x=d[i];const v=b0*x+b1*x1+b2*x2-a1*y1-a2*y2;x2=x1;x1=x;y2=y1;y1=v;y[i]=v}return y}
+function denoise(d,sr,strength){const y=hpf(d,sr,90);const a=analyze(y,sr,0,y.length);const th=a.th*0.8;if(th<1e-6)return y;
+  const ga=Math.exp(-1/(sr*0.002)),gr=Math.exp(-1/(sr*0.03)),op=Math.exp(-1/(sr*0.003)),cl=Math.exp(-1/(sr*0.06)),H=Math.floor(sr*0.05),gmin=Math.pow(10,-strength/20);
+  let env=0,g=1,hold=0;
+  for(let i=0;i<y.length;i++){const v=y[i]<0?-y[i]:y[i];env=v>env?ga*env+(1-ga)*v:gr*env+(1-gr)*v;let tg;
+    if(env>=th){tg=1;hold=H}else if(hold>0){hold--;tg=1}else tg=Math.max(gmin,(env/th)*(env/th));
+    g=tg>g?op*g+(1-op)*tg:cl*g+(1-cl)*tg;y[i]*=g}
+  return y}
+function cleanSheet(){const t=trk(selT),c=takeOf(t);if(!c)return;if(playing)stopPlay(true);const k=t.pick[segIdx(t)];const sug=autoGainDb(c);
+  openSheet(`<h3>소리 정리</h3><p>${esc(t.name)} · 테이크 ${k+1}</p>
+  <h5>음량 맞추기</h5><p>연주하는 부분의 크기를 재서 알맞게 맞춥니다. 녹음 원본은 그대로 두고 클립 크기만 바꿉니다.</p>
+  <div class="row"><button class="btn pri" id="clG">이 테이크 맞추기 (${fDb(c.gain||0)} → ${fDb(sug)}dB)</button><button class="btn" id="clGA">모든 트랙 맞추기</button></div>
+  <h5>잡음 줄이기</h5><p>웅웅거리는 낮은 소리를 걸러 내고, 연주를 쉬는 동안 들리는 배경 소음을 줄입니다. 연주와 함께 섞인 잡음은 거의 그대로 남습니다.</p>
+  <div class="row"><button class="btn" data-nr="12">약하게</button><button class="btn" data-nr="24">강하게</button></div>
+  <p>마음에 안 들면 되돌리기(↶)로 원래대로 돌릴 수 있습니다.</p><div id="clOut"></div>`);
+  $('#clG').onclick=()=>{pushUndo();c.gain=sug;renderAll();touch();closeSheet();toast('음량을 '+fDb(sug)+'dB로 맞췄습니다')};
+  $('#clGA').onclick=()=>{closeSheet();autoLevelAll()};
+  $('#sheet').querySelectorAll('[data-nr]').forEach(b=>b.onclick=async()=>{const st=+b.dataset.nr;$('#clOut').innerHTML='<span class="note">정리하는 중…</span>';await new Promise(r=>setTimeout(r,30));
+    const src=BUF.get(c.buf);if(!src){closeSheet();return}const y=denoise(src.data,src.sr,st);const id=uid();await addBuffer(id,src.sr,y);
+    pushUndo();c.buf=id;dirty=true;touch();closeSheet();toast('잡음을 줄였습니다 ('+(st===12?'약하게':'강하게')+'). ▶ 로 들어 보세요',3000)})}
 
 /* ───────── 시트 ───────── */
 let sheetClose=null;
@@ -686,17 +818,18 @@ function pickInstrument(cb){openSheet(`<h3>어떤 악기를 녹음할까요?</h3
   $('#sheet').querySelectorAll('[data-inst]').forEach(b=>b.onclick=()=>{closeSheet();cb(b.dataset.inst)})}
 
 function trackSheet(id){const t=trk(id);if(!t)return;const I=INST[t.inst]||INST.other;
-  const takes=t.takes.map((c,i)=>`<div class="it${i===t.active?' cur':''}"><button class="grow" data-take="${i}"><b>테이크 ${i+1}${i===t.active?' · 사용 중':''}</b><small>${fmtT(c.te-c.ts)} · ${c.at?new Date(c.at).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}):'불러온 파일'}</small></button><button class="x" data-deltake="${i}">지우기</button></div>`).join('');
+  const takes=t.takes.map((c,i)=>`<div class="it${t.pick.includes(i)?' cur':''}"><button class="grow" data-take="${i}"><b>테이크 ${i+1}${t.pick.includes(i)?' · 사용 중':''}</b><small>${fmtT(c.te-c.ts)} · ${c.at?new Date(c.at).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}):'불러온 파일'}</small></button><button class="x" data-deltake="${i}">지우기</button></div>`).join('');
   openSheet(`<h3>${esc(t.name)}</h3>
   <h5>이름</h5><input type="text" id="tName" value="${esc(t.name)}" maxlength="30">
   <h5>악기</h5><div class="chips">${Object.entries(INST).map(([k,J])=>`<button class="chip" data-inst="${k}" style="--tc:${J.color}" aria-pressed="${k===t.inst}"><i></i>${J.name}</button>`).join('')}</div>
-  <h5>테이크</h5>${takes?`<div class="list">${takes}</div><p>같은 트랙에서 다시 녹음하면 새 테이크가 쌓입니다. 가장 잘된 것을 골라 쓰세요.</p>`:'<p>아직 녹음이 없습니다.</p>'}
+  <h5>테이크</h5>${takes?`<div class="list">${takes}</div><p>누르면 트랙 전체에 그 테이크를 씁니다. 부분만 바꾸려면 클립 막대의 "여기서 나누기"로 나눈 뒤 구간마다 고르세요.</p>${t.cuts.length?'<div class="row" style="margin-top:6px"><button class="btn" id="tUncut">나눔 '+t.cuts.length+'개 모두 지우기</button></div>':''}`:'<p>아직 녹음이 없습니다.</p>'}
   <h5>더 하기</h5><div class="row"><button class="btn" id="tImport">소리 파일 불러오기</button><button class="btn dan" id="tDel">트랙 지우기</button></div>
   <input type="file" id="tFile" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.ogg,.aac,.flac" hidden>`,()=>{const v=($('#tName')||{}).value;});
   const nm=$('#tName');nm.addEventListener('change',()=>{const v=nm.value.trim();if(v&&v!==t.name){pushUndo();t.name=v;renderAll();touch()}});
   $('#sheet').querySelectorAll('[data-inst]').forEach(b=>b.onclick=()=>{if(b.dataset.inst===t.inst)return;pushUndo();t.inst=b.dataset.inst;renderAll();touch();trackSheet(id)});
-  $('#sheet').querySelectorAll('[data-take]').forEach(b=>b.onclick=()=>{pushUndo();t.active=+b.dataset.take;selT=t.id;selClip=true;renderAll();touch();trackSheet(id)});
-  $('#sheet').querySelectorAll('[data-deltake]').forEach(b=>b.onclick=()=>{pushUndo();t.takes.splice(+b.dataset.deltake,1);t.active=clamp(t.active,0,Math.max(0,t.takes.length-1));renderAll();touch();trackSheet(id)});
+  $('#sheet').querySelectorAll('[data-take]').forEach(b=>b.onclick=()=>{pushUndo();const k=+b.dataset.take;t.pick=t.pick.map(()=>k);selT=t.id;selClip=true;renderAll();touch();trackSheet(id)});
+  {const u=$('#tUncut');if(u)u.onclick=()=>{pushUndo();const k=t.pick[segIdx(t)];t.cuts=[];t.pick=[t.takes[k]?k:0];selS=0;renderAll();touch();trackSheet(id)}}
+  $('#sheet').querySelectorAll('[data-deltake]').forEach(b=>b.onclick=()=>{pushUndo();removeTake(t,+b.dataset.deltake);renderAll();touch();trackSheet(id)});
   $('#tDel').onclick=()=>confirmSheet(`'${t.name}' 트랙을 지울까요?`,'되돌리기(↶)로 다시 살릴 수 있습니다.','트랙 지우기',()=>{pushUndo();P.tracks=P.tracks.filter(x=>x.id!==id);if(selT===id)selT=null;if(armed===id)armed=null;syncChains();renderAll();touch()});
   $('#tImport').onclick=()=>$('#tFile').click();
   $('#tFile').onchange=async e=>{const f=e.target.files[0];if(!f)return;closeSheet();await importFile(t,f)}}
@@ -704,19 +837,25 @@ async function importFile(t,f){ensureAC();toast('불러오는 중…',8000);
   try{const ab=await ac.decodeAudioData(await f.arrayBuffer());const n=ab.length,d=new Float32Array(n);
     for(let ch=0;ch<ab.numberOfChannels;ch++){const s=ab.getChannelData(ch);for(let i=0;i<n;i++)d[i]+=s[i]/ab.numberOfChannels}
     const id=uid();await addBuffer(id,ab.sampleRate,d);pushUndo();
-    t.takes.push({buf:id,off:pos,ts:0,te:n/ab.sampleRate,fi:0.01,fo:0.03,gain:0,at:0});t.active=t.takes.length-1;selT=t.id;selClip=true;renderAll();touch();toast("'"+f.name+"'을(를) 불러왔습니다. 끌어서 위치를 맞추세요",3500)}
+    t.takes.push({buf:id,off:pos,ts:0,te:n/ab.sampleRate,fi:0.01,fo:0.03,gain:0,at:0});useNewTake(t,t.takes.length-1);renderAll();touch();toast("'"+f.name+"'을(를) 불러왔습니다. 끌어서 위치를 맞추세요",3500)}
   catch(e){toast('이 파일은 읽을 수 없습니다: '+(e.message||e.name),4000)}}
 
 /* 프로젝트 목록 */
 async function projectsSheet(){await saveProject();const all=(await idb.all('projects')).sort((a,b)=>b.updated-a.updated);
   openSheet(`<h3>프로젝트</h3><p>녹음은 이 기기의 브라우저 안에 저장됩니다. 브라우저 데이터를 지우면 함께 지워지니, 완성한 곡은 "곡 보내기"로 꼭 파일로 남겨 두세요.</p>
   <div class="row" style="margin:12px 0"><button class="btn pri" id="pNew">새 프로젝트</button><button class="btn" id="pRen">이름 바꾸기</button></div>
+  <h5>백업 파일</h5><p>녹음까지 담은 프로젝트를 파일 하나로 내보내 두거나, 다른 기기로 옮길 수 있습니다.</p>
+  <div class="row" style="margin-bottom:12px"><button class="btn" id="pBak">지금 프로젝트 내보내기</button><button class="btn" id="pImp">백업 파일 가져오기</button></div><div id="pBakOut"></div>
+  <input type="file" id="pFile" hidden>
+  <h5>이 기기의 프로젝트</h5>
   <div class="list">${all.map(p=>`<div class="it${p.id===P.id?' cur':''}"><button class="grow" data-open="${p.id}"><b>${esc(p.name)}</b><small>${new Date(p.updated).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} · 트랙 ${p.tracks.length}</small></button>${p.id===P.id?'':`<button class="x" data-del="${p.id}">지우기</button>`}</div>`).join('')}</div>`);
+  $('#pBak').onclick=async()=>{const o=$('#pBakOut');o.innerHTML='<span class="note">백업 파일을 만드는 중…</span>';try{const f=await exportBackup();o.innerHTML='<div class="note">'+esc(f.name)+' · '+(f.size/1048576).toFixed(1)+'MB</div><div id="pBakAct"></div>';offerFile(f,$('#pBakAct'))}catch(e){o.innerHTML='<span class="note warn">만들지 못했습니다: '+esc(e.message)+'</span>'}};
+  $('#pImp').onclick=()=>$('#pFile').click();$('#pFile').onchange=async e=>{const f=e.target.files[0];if(!f)return;closeSheet();await importBackup(f)};
   $('#pNew').onclick=async()=>{closeSheet();if(playing)stopPlay();await openProject(newProject('합주 '+(all.length+1)),true)};
   $('#pRen').onclick=()=>{openSheet(`<h3>이름 바꾸기</h3><input type="text" id="rn" value="${esc(P.name)}" maxlength="40"><div class="row" style="margin-top:12px"><button class="btn pri" id="rnOk">바꾸기</button></div>`);const i=$('#rn');i.focus();i.select();$('#rnOk').onclick=()=>{const v=i.value.trim();if(v){P.name=v;renderTop();touch()}closeSheet()}};
   $('#sheet').querySelectorAll('[data-open]').forEach(b=>b.onclick=async()=>{closeSheet();if(b.dataset.open===P.id)return;if(playing)stopPlay();await saveProject();const p=await idb.get('projects',b.dataset.open);if(p)await openProject(p)});
   $('#sheet').querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{const p=all.find(x=>x.id===b.dataset.del);confirmSheet(`'${p.name}'을(를) 지울까요?`,'녹음까지 모두 지워지며 되돌릴 수 없습니다.','영영 지우기',async()=>{await idb.del('projects',p.id);await idb.delPid(p.id);toast('지웠습니다');projectsSheet()})})}
-async function openProject(p,isNew){BUF.clear();undoStack=[];selT=null;selClip=false;armed=null;P=p;view={pps:(p.view&&p.view.pps)||46,x0:(p.view&&p.view.x0)||0};pos=0;
+async function openProject(p,isNew){BUF.clear();stCache.clear();migrate(p);undoStack=[];selT=null;selClip=false;armed=null;P=p;view={pps:(p.view&&p.view.pps)||46,x0:(p.view&&p.view.x0)||0};pos=0;
   if(!isNew){try{const bs=await idb.byPid(p.id);for(const b of bs)BUF.set(b.id,{sr:b.sr,data:b.data,peaks:mkPeaks(b.data)})}catch(e){}}
   if(ac){for(const [,c] of CH){try{c.pan.disconnect();c.send.disconnect()}catch(e){}}CH.clear();syncChains()}
   try{localStorage.setItem('hapju.last',p.id)}catch(e){}
@@ -781,26 +920,67 @@ function encWav(L,R,sr){const n=L.length,buf=new ArrayBuffer(44+n*4),v=new DataV
   w(0,'RIFF');v.setUint32(4,36+n*4,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,2,true);v.setUint32(24,sr,true);v.setUint32(28,sr*4,true);v.setUint16(32,4,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,n*4,true);
   let o=44;for(let i=0;i<n;i++){const a=clamp(L[i]+(Math.random()-Math.random())/65536,-1,1),b=clamp(R[i]+(Math.random()-Math.random())/65536,-1,1);v.setInt16(o,a<0?a*32768:a*32767,true);v.setInt16(o+2,b<0?b*32768:b*32767,true);o+=4}
   return new Blob([buf],{type:'audio/wav'})}
-async function renderMix(){const end=projEnd();if(end<=0)return null;const sr=48000;const dur=end+ (P.tracks.some(t=>t.rev>0)?ROOMS[P.master.room].len:0.3);
+async function renderMix(){const end=projEnd();if(end<=0)return null;const sr=48000;const dur=end+(P.tracks.some(t=>t.rev>0)?ROOMS[P.master.room].len:0.3);
   const oc=new OfflineAudioContext(2,Math.ceil(dur*sr),sr);const m=makeMaster(oc);
-  for(const t of P.tracks){const c=takeOf(t);if(!c)continue;const ch=makeChain(oc,m,t);ch.fad.gain.value=effGain(t,false);schedClip(oc,ch.in,c,0,0,null)}
-  const r=await oc.startRendering();return r}
+  for(const t of P.tracks){const ch=makeChain(oc,m,t);ch.fad.gain.value=effGain(t,false);for(const q of segs(t))if(q.c)schedClip(oc,ch.in,q.c,0,0,Infinity,1,q.a,q.b,null)}
+  return await oc.startRendering()}
+const safeName=s=>(s||'합주').replace(/[\\/:*?"<>|]/g,'_');
+let lameP=null;
+function loadLame(){if(window.lamejs)return Promise.resolve();if(lameP)return lameP;
+  lameP=new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js';s.onload=()=>window.lamejs?res():rej(new Error('MP3 도구를 읽지 못했습니다'));s.onerror=()=>{lameP=null;rej(new Error('MP3 도구를 받지 못했습니다. 인터넷 연결을 확인하세요'))};document.head.appendChild(s)});return lameP}
+async function encMp3(L,R,sr,prog){await loadLame();const enc=new lamejs.Mp3Encoder(2,sr,160);const n=L.length,B=1152*16,out=[];const l=new Int16Array(B),r=new Int16Array(B);
+  for(let i=0,k=0;i<n;i+=B,k++){const m=Math.min(B,n-i);for(let j=0;j<m;j++){const a=clamp(L[i+j],-1,1),b=clamp(R[i+j],-1,1);l[j]=a<0?a*32768:a*32767;r[j]=b<0?b*32768:b*32767}
+    const mp=enc.encodeBuffer(m<B?l.subarray(0,m):l,m<B?r.subarray(0,m):r);if(mp.length)out.push(new Uint8Array(mp));if(k%8===7){prog&&prog(i/n);await new Promise(z=>setTimeout(z,0))}}
+  const e=enc.flush();if(e.length)out.push(new Uint8Array(e));return new Blob(out,{type:'audio/mpeg'})}
+// 파일 건네기: 공유(되는 기기) + 저장 링크
+function offerFile(file,el){const url=URL.createObjectURL(file);const can=!!(navigator.canShare&&navigator.canShare({files:[file]}));
+  el.innerHTML=`<div class="row" style="margin-top:12px">${can?'<button class="btn pri" data-sh>공유하기 (카톡 등)</button>':''}<a class="btn${can?'':' pri'}" href="${url}" download="${esc(file.name)}" style="display:inline-flex;align-items:center;text-decoration:none">파일로 저장</a></div>`;
+  if(can)el.querySelector('[data-sh]').onclick=async()=>{try{await navigator.share({files:[file],title:file.name})}catch(e){if(e.name!=='AbortError')toast('공유하지 못했습니다: '+e.message)}}}
 async function exportSheet(){if(recording)return;if(playing)stopPlay();const end=projEnd();
   if(end<=0){openSheet('<h3>곡 보내기</h3><p>아직 녹음된 트랙이 없습니다.</p>');return}
-  openSheet(`<h3>곡 보내기</h3><p>지금 믹서 설정 그대로 모든 트랙을 하나의 소리 파일(WAV)로 합칩니다. 소리를 끈(M) 트랙은 빠지고, S를 켠 트랙이 있으면 그 트랙만 들어갑니다.</p><div id="exOut" class="note" style="margin-top:10px">합치는 중…</div>`);
-  try{const r=await renderMix();const L=r.getChannelData(0),R=r.getChannelData(1);let pk=0;for(let i=0;i<L.length;i++){const a=Math.max(Math.abs(L[i]),Math.abs(R[i]));if(a>pk)pk=a}
-    const blob=encWav(L,R,r.sampleRate);const name=(P.name||'합주').replace(/[\\/:*?"<>|]/g,'_')+'.wav';const file=new File([blob],name,{type:'audio/wav'});
-    const url=URL.createObjectURL(blob);const canShare=!!(navigator.canShare&&navigator.canShare({files:[file]}));
-    const o=$('#exOut');if(!o)return;o.outerHTML=`<div class="note" style="margin-top:10px">${esc(name)} · ${fmtT(r.length/r.sampleRate)} · ${(blob.size/1048576).toFixed(1)}MB${pk>0.99?'<br>가장 큰 소리가 한계에 닿았습니다. 믹서에서 "전체"를 조금 낮추면 더 깨끗합니다.':''}</div>
-      <audio controls src="${url}" style="width:100%;margin-top:10px"></audio>
-      <div class="row" style="margin-top:12px">${canShare?'<button class="btn pri" id="exShare">공유하기 (카톡 등)</button>':''}<a class="btn${canShare?'':' pri'}" id="exSave" href="${url}" download="${esc(name)}" style="display:inline-flex;align-items:center;text-decoration:none">파일로 저장</a></div>`;
-    if(canShare)$('#exShare').onclick=async()=>{try{await navigator.share({files:[file],title:P.name})}catch(e){if(e.name!=='AbortError')toast('공유하지 못했습니다: '+e.message)}}}
-  catch(e){const o=$('#exOut');if(o)o.textContent='합치지 못했습니다: '+e.message}}
+  openSheet(`<h3>곡 보내기</h3><p>지금 믹서 설정 그대로 모든 트랙을 하나의 소리 파일로 합칩니다. 소리를 끈(M) 트랙은 빠지고, S를 켠 트랙이 있으면 그 트랙만 들어갑니다.</p><div id="exOut" class="note" style="margin-top:10px">합치는 중…</div>`);
+  let r;try{r=await renderMix()}catch(e){const o=$('#exOut');if(o)o.textContent='합치지 못했습니다: '+e.message;return}
+  const L=r.getChannelData(0),R=r.getChannelData(1);let pk=0;for(let i=0;i<L.length;i++){const a=Math.max(Math.abs(L[i]),Math.abs(R[i]));if(a>pk)pk=a}
+  const dur=r.length/r.sampleRate,base=safeName(P.name);const wav=new File([encWav(L,R,r.sampleRate)],base+'.wav',{type:'audio/wav'});const url=URL.createObjectURL(wav);
+  const o=$('#exOut');if(!o)return;
+  o.outerHTML=`<div class="note" style="margin-top:10px">${esc(P.name)} · ${fmtT(dur)}${pk>0.99?'<br>가장 큰 소리가 한계에 닿았습니다. 믹서에서 "전체"를 조금 낮추면 더 깨끗합니다.':''}</div>
+    <audio controls src="${url}" style="width:100%;margin-top:10px"></audio>
+    <h5>파일 형식</h5><div class="chips"><button class="chip" data-fmt="mp3" aria-pressed="true">MP3 · 작은 파일 (약 ${(dur*20/1024).toFixed(1)}MB)</button><button class="chip" data-fmt="wav" aria-pressed="false">WAV · 원본 음질 (${(wav.size/1048576).toFixed(1)}MB)</button></div>
+    <div id="exAct"></div>`;
+  let mp3=null;
+  const choose=async fmt=>{$('#sheet').querySelectorAll('[data-fmt]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.fmt===fmt));const act=$('#exAct');if(!act)return;
+    if(fmt==='wav'){offerFile(wav,act);return}
+    if(mp3){offerFile(mp3,act);return}
+    act.innerHTML='<div class="note" style="margin-top:12px" id="mp3p">MP3로 바꾸는 중… 0%</div>';
+    try{const b=await encMp3(L,R,r.sampleRate,f=>{const e=$('#mp3p');if(e)e.textContent='MP3로 바꾸는 중… '+Math.round(f*100)+'%'});mp3=new File([b],base+'.mp3',{type:'audio/mpeg'});
+      const a2=$('#exAct');if(a2&&$('[data-fmt=mp3]').getAttribute('aria-pressed')==='true'){offerFile(mp3,a2);a2.insertAdjacentHTML('afterbegin','<p>'+(mp3.size/1048576).toFixed(1)+'MB</p>')}}
+    catch(e){const a2=$('#exAct');if(a2)a2.innerHTML='<div class="note warn" style="margin-top:12px">'+esc(e.message)+'. WAV로는 보낼 수 있습니다.</div>'}};
+  $('#sheet').querySelectorAll('[data-fmt]').forEach(b=>b.onclick=()=>choose(b.dataset.fmt));choose('mp3')}
+
+/* ───────── 백업 파일 (.hapju) ─────────
+   'HAPJU1\n' + 머리말 길이(uint32) + JSON{project, buffers:[{id,sr,len,sc}]} + 소리마다 16비트 PCM */
+async function exportBackup(){await saveProject();const ids=new Set();for(const t of P.tracks)for(const c of t.takes)ids.add(c.buf);
+  const bufs=[],parts=[];
+  for(const id of ids){const b=BUF.get(id);if(!b)continue;let pk=0;for(let i=0;i<b.data.length;i++){const a=b.data[i]<0?-b.data[i]:b.data[i];if(a>pk)pk=a}
+    const sc=pk>1?pk:1,q=new Int16Array(b.data.length);for(let i=0;i<q.length;i++){const v=b.data[i]/sc;q[i]=v<0?Math.max(-32768,Math.round(v*32768)):Math.min(32767,Math.round(v*32767))}
+    bufs.push({id,sr:b.sr,len:q.length,sc});parts.push(q)}
+  const head=new TextEncoder().encode(JSON.stringify({app:'hapju',v:1,ver:VERSION,project:P,buffers:bufs}));const lb=new Uint8Array(4);new DataView(lb.buffer).setUint32(0,head.length,true);
+  return new File([new TextEncoder().encode('HAPJU1\n'),lb,head,...parts],safeName(P.name)+'.hapju',{type:'application/octet-stream'})}
+async function importBackup(f){toast('가져오는 중…',20000);
+  try{const ab=await f.arrayBuffer();const u=new Uint8Array(ab);if(u.length<11||new TextDecoder().decode(u.subarray(0,7))!=='HAPJU1\n')throw new Error('혼자 합주실 백업 파일이 아닙니다');
+    const hl=new DataView(ab).getUint32(7,true);const meta=JSON.parse(new TextDecoder().decode(u.subarray(11,11+hl)));let o=11+hl;
+    const p=migrate(meta.project);p.id=uid();const map={};
+    for(const b of meta.buffers){if(o+b.len*2>ab.byteLength)throw new Error('파일이 잘려 있습니다');const q=new Int16Array(ab.slice(o,o+b.len*2));o+=b.len*2;
+      const d=new Float32Array(b.len),k=(b.sc||1)/32768;for(let i=0;i<b.len;i++)d[i]=q[i]*k;const nid=uid();map[b.id]=nid;await idb.put('buffers',{id:nid,pid:p.id,sr:b.sr,data:d})}
+    for(const t of p.tracks){t.id=uid();for(const c of t.takes)c.buf=map[c.buf]||c.buf}
+    const all=await idb.all('projects');if(all.some(x=>x.name===p.name))p.name+=' (가져옴)';p.updated=Date.now();await idb.put('projects',p);
+    if(playing)stopPlay();await saveProject();await openProject(p);toast("'"+p.name+"'을(를) 가져왔습니다",3000)}
+  catch(e){toast('가져오지 못했습니다: '+e.message,4500)}}
 
 /* ───────── 예시 곡 ───────── */
 function demoProject(){const p=newProject('예시: 작은 합주');p.bpm=96;p.beats=4;p.master.room='hall';const sr=44100;const spb=60/96,bars=8,len=Math.ceil((bars*4*spb+1.5)*sr);
   const bufs=[];const add=(inst,d,vol,name)=>{const I=INST[inst];const id=uid();bufs.push({id,pid:p.id,sr,data:d});
-    p.tracks.push({id:uid(),name:name||I.name,inst,vol,pan:I.pan,eq:I.eq.slice(),rev:I.rev,mute:false,solo:false,takes:[{buf:id,off:0,ts:0,te:d.length/sr,fi:0.01,fo:0.3,gain:0,at:0}],active:0})};
+    p.tracks.push({id:uid(),name:name||I.name,inst,vol,pan:I.pan,eq:I.eq.slice(),rev:I.rev,mute:false,solo:false,takes:[{buf:id,off:0,ts:0,te:d.length/sr,fi:0.01,fo:0.3,gain:0,at:0}],cuts:[],pick:[0]})};
   const mf=m=>440*Math.pow(2,(m-69)/12);
   // 기타: 카플러스-스트롱 스트럼
   const chords=[[48,52,55,60,64],[43,47,50,55,59,67],[45,52,57,60,64],[41,48,53,57,60,65],[48,52,55,60,64],[43,47,50,55,59,67],[41,48,53,57,60,65],[48,52,55,60,64]];
@@ -825,17 +1005,23 @@ function demoProject(){const p=newProject('예시: 작은 합주');p.bpm=96;p.be
   return {p,bufs}}
 
 /* ───────── 루프 · 시작 ───────── */
-function updClock(){if(!P)return;const t=curTime();$('#clkT').textContent=fmtT(t);$('#clkB').textContent=recording&&ac.currentTime<recT0?'카운트인…':(recording?'● 녹음 중 · ':'')+barBeat(t)}
+function updClock(){if(!P)return;const t=curTime();$('#clkT').textContent=fmtT(t);let b=recording&&ac.currentTime<recT0?'카운트인…':(recording?'● 녹음 중 · ':'')+barBeat(t);
+  if(P.loop.on&&P.loop.b>P.loop.a)b+=' · 반복';if(P.rate<1&&!recording)b+=' · '+Math.round(P.rate*100)+'%';$('#clkB').textContent=b}
 function frame(){requestAnimationFrame(frame);if(!P)return;
-  if(playing){const t=curTime();if(!recording&&t>projEnd()+1.5&&projEnd()>0){stopPlay();}
+  if(playing){const t=curTime();if(!recording&&!(PL&&PL.lp)&&t>projEnd()+1.5&&projEnd()>0){stopPlay();}
     const W=cL.clientWidth;const x=(t-view.x0)*view.pps;if(!drag&&(x>W*0.85||x<0))view.x0=Math.max(0,t-W*0.15/view.pps);dirty=true;updClock();if(!$('#vMixer').hidden)meters()}
   if(dirty)draw();
   if(mic){inPeak*=0.93;const v=clamp((20*Math.log10(inPeak+1e-6)+50)/50,0,1);$('#inBar').style.width=(v*100)+'%';$('#inlv').classList.toggle('hot',inPeak>0.95)}}
 // 단추
 $('#bPlay').onclick=togglePlay;$('#bRec').onclick=()=>recording?stopRec():startRec();
-$('#bHome').onclick=()=>{if(recording)return;const was=playing;if(was)stopPlay(true);setPos(0);view.x0=0;if(was)startPlay(0,ac.currentTime+0.05,0)};
+$('#bHome').onclick=()=>{if(recording)return;const was=playing;if(was)stopPlay(true);setPos(0);view.x0=0;if(was)startPlay(0,ac.currentTime+0.05,0,P.rate)};
 $('#bUndo').onclick=undo;$('#bSet').onclick=settingsSheet;$('#bProj').onclick=()=>{if(!recording)projectsSheet()};$('#bExp').onclick=exportSheet;$('#bTuner').onclick=()=>{if(!recording)tunerSheet()};
-$('#bMetro').onclick=()=>{P.metro=!P.metro;if(metro)metro.on=P.metro;renderTop();touch()};
+$('#bMetro').onclick=()=>{P.metro=!P.metro;renderTop();touch()};
+$('#bLoop').onclick=()=>{if(recording)return;const L=P.loop;if(!L.on&&!(L.b>L.a)){const bar=60/P.bpm*P.beats,t=playing?curTime():pos;L.a=Math.floor(t/bar+1e-6)*bar;L.b=L.a+2*bar}
+  L.on=!L.on;renderTop();updClock();dirty=true;touch();
+  if(L.on&&!S.seen.loop){S.seen.loop=1;saveS();toast('자 위 주황 띠의 양 끝을 끌어 반복할 구간을 바꾸세요. 반복하며 녹음하면 회마다 테이크가 쌓입니다',4500)}
+  if(playing){const was=curTime();stopPlay(true);startPlay(was,ac.currentTime+0.05,0,P.rate)}};
+$('#selRate').onchange=async e=>{P.rate=+e.target.value;touch();updClock();if(playing&&!recording){const was=curTime();stopPlay(true);await prepareRate(P.rate);if(!playing&&!recording)startPlay(was,ac.currentTime+0.06,0,P.rate)}};
 $('#bCount').onclick=()=>{P.countIn=!P.countIn;renderTop();touch()};
 const bpm=d=>{if(recording)return;pushUndo();P.bpm=clamp(P.bpm+d,30,240);renderTop();dirty=true;touch()};
 let bpmHold;const hold=(el,d)=>{el.addEventListener('pointerdown',()=>{bpm(d);let k=0;bpmHold=setInterval(()=>{k++;if(k>3)bpm(d)},120)});['pointerup','pointerleave','pointercancel'].forEach(t=>el.addEventListener(t,()=>clearInterval(bpmHold)))};
@@ -845,7 +1031,7 @@ $('#bZoomI').onclick=()=>zoom(1.5);$('#bZoomO').onclick=()=>zoom(1/1.5);
 function setTab(m){$('#tabT').setAttribute('aria-selected',!m);$('#tabM').setAttribute('aria-selected',m);$('#vTracks').hidden=m;$('#vMixer').hidden=!m;if(m)renderMixer();renderClipbar();dirty=true}
 $('#tabT').onclick=()=>setTab(false);$('#tabM').onclick=()=>setTab(true);
 document.addEventListener('keydown',e=>{if(e.target.matches('input[type=text],select'))return;if(!$('#scrim').hidden){if(e.key==='Escape')closeSheet();return}
-  if(e.code==='Space'){e.preventDefault();togglePlay()}else if(e.key==='r'||e.key==='R'){recording?stopRec():startRec()}else if((e.ctrlKey||e.metaKey)&&e.key==='z'){e.preventDefault();undo()}else if(e.key==='Home'){$('#bHome').click()}});
+  if(e.code==='Space'){e.preventDefault();togglePlay()}else if(e.key==='l'||e.key==='L'){$('#bLoop').click()}else if(e.key==='r'||e.key==='R'){recording?stopRec():startRec()}else if((e.ctrlKey||e.metaKey)&&e.key==='z'){e.preventDefault();undo()}else if(e.key==='Home'){$('#bHome').click()}});
 document.addEventListener('visibilitychange',()=>{if(document.hidden){if(recording)stopRec();else{if(playing)stopPlay();closeMic()}saveProject()}});
 window.addEventListener('pagehide',()=>saveProject());
 new ResizeObserver(()=>{dirty=true}).observe($('#laneWrap'));
