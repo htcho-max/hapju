@@ -1,0 +1,16 @@
+{
+  "name": "혼자 합주실",
+  "short_name": "합주실",
+  "description": "악기를 하나씩 녹음해 겹쳐 쌓고 믹싱하는 녹음실",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#101318",
+  "theme_color": "#14181f",
+  "lang": "ko",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
